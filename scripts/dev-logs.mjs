@@ -3,7 +3,11 @@
 //
 //   node scripts/dev-logs.mjs [--package com.mli.mspace] [--device emulator-5554]
 //                             [--port 3100] [--full] [--headers] [--all-logcat]
-//                             [--no-server] [--no-color] [--log-file out.log]
+//                             [--no-server] [--no-color] [--no-clear]
+//                             [--grep <term>] [--log-file out.log]
+//
+// Keys while running: "/" search (filter + highlight, including earlier
+// entries), Esc clear search, "c" clear screen, "?" help, Ctrl+C quit.
 //
 // It starts `node lib/index.js --listen 127.0.0.1:<port>` and streams two things
 // into one readable feed:
@@ -12,7 +16,7 @@
 
 import { spawn, execFileSync } from "node:child_process";
 import { appendFileSync } from "node:fs";
-import { createInterface } from "node:readline";
+import { createInterface, emitKeypressEvents } from "node:readline";
 import { fileURLToPath } from "node:url";
 import { dirname, resolve } from "node:path";
 
@@ -32,6 +36,7 @@ const SHOW_HEADERS = flag("headers");
 const ALL_LOGCAT = flag("all-logcat");
 const NO_SERVER = flag("no-server");
 const CLEAR_ON_RESTART = !flag("no-clear");
+const INITIAL_GREP = opt("grep", null);
 const COLOR = !flag("no-color") && process.stdout.isTTY;
 const LOG_FILE = opt("log-file", null);
 const MAX_INLINE = FULL ? Infinity : 320;
@@ -51,15 +56,37 @@ const red = s => c("31", s);
 const magenta = s => c("35", s);
 const blue = s => c("34", s);
 
-const out = line => {
-	process.stdout.write(line + "\n");
-	if (LOG_FILE) {
-		appendFileSync(LOG_FILE, line.replace(/\x1b\[[0-9;]*m/g, "") + "\n");
-	}
-};
-
 const now = () => new Date().toTimeString().slice(0, 8);
 const stripAnsi = s => s.replace(/\x1b\[[0-9;]*m/g, "");
+const write = s => process.stdout.write(s);
+
+// ---------- records, history and search ----------
+// Every printed entry is a "record" (a single line, or a whole MCP/API block).
+// Records are kept in memory so a search can be applied to what was already
+// printed, not just to new output. Press "/" in the terminal to search.
+const MAX_HISTORY = 5000;
+const history = [];
+let filter = null; // { term, test: RegExp, mark: RegExp }
+let typing = null; // text being typed after "/" or null
+
+const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+const matches = record => !filter || filter.test.test(stripAnsi(record));
+const highlight = record => (filter ? record.replace(filter.mark, m => c("7", m)) : record);
+
+const out = record => {
+	history.push(record);
+	if (history.length > MAX_HISTORY) {
+		history.shift();
+	}
+
+	if (LOG_FILE) {
+		appendFileSync(LOG_FILE, stripAnsi(record) + "\n");
+	}
+
+	if (typing === null && matches(record)) {
+		write(highlight(record) + "\n");
+	}
+};
 
 const compactJson = value => {
 	const s = typeof value === "string" ? value : JSON.stringify(value);
@@ -97,12 +124,8 @@ const statusColor = status => {
 };
 
 const box = (title, lines, footer) => {
-	out(title);
-	for (const l of lines) {
-		out(`${dim("|")}  ${l}`);
-	}
-	out(`${dim("+--")} ${footer ?? ""}`);
-	out("");
+	const block = [title, ...lines.map(l => `${dim("|")}  ${l}`), `${dim("+--")} ${footer ?? ""}`, ""];
+	out(block.join("\n"));
 };
 
 // ---------- MCP side: parse the request-logger stream ----------
@@ -475,7 +498,7 @@ const attachLogcat = pid => {
 
 const clearScreen = () => {
 	if (process.stdout.isTTY) {
-		process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
+		write("\x1b[2J\x1b[3J\x1b[H");
 	}
 };
 
@@ -484,6 +507,7 @@ const followLogcat = () => {
 	if (pid && pid !== currentPid) {
 		if (runCount > 0) {
 			if (CLEAR_ON_RESTART) {
+				history.length = 0;
 				clearScreen();
 				printHeader();
 				out(`${bold(blue("APP"))}  ${dim(now())}  ${yellow(`${PACKAGE} run #${runCount + 1} started (pid ${pid}). Terminal cleared.`)}`);
@@ -507,11 +531,115 @@ const followLogcat = () => {
 };
 
 const printHeader = () => {
-	out(bold(`mobile-mcp dev logs  ${dim("-")}  app ${PACKAGE}  ${dim("-")}  device ${DEVICE}  ${dim("-")}  ${NO_SERVER ? "server: external" : `server http://127.0.0.1:${PORT}/mcp`}`));
-	out(dim("flags: --full (no truncation)  --headers (show redacted headers)  --all-logcat  --no-clear (keep logs across app restarts)  --no-server  --log-file <path>"));
-	out("");
+	write(bold(`mobile-mcp dev logs  ${dim("-")}  app ${PACKAGE}  ${dim("-")}  device ${DEVICE}  ${dim("-")}  ${NO_SERVER ? "server: external" : `server http://127.0.0.1:${PORT}/mcp`}`) + "\n");
+	write(dim("keys:  /  search (filters + highlights, includes earlier logs)   Esc  clear search   c  clear screen   ?  help   Ctrl+C  quit") + "\n");
+	if (filter) {
+		const count = history.filter(matches).length;
+		write(yellow(`filter: "${filter.term}"  -  ${count} of ${history.length} entries match  -  Esc to clear`) + "\n");
+	}
+
+	write("\n");
 };
 
-clearScreen();
-printHeader();
+// Redraw the screen from history, applying the current filter.
+const redraw = () => {
+	clearScreen();
+	printHeader();
+	const visible = history.filter(matches);
+	const shown = filter ? visible : visible.slice(-300);
+	if (!filter && visible.length > shown.length) {
+		write(dim(`...(${visible.length - shown.length} earlier entries not shown, use / to search them)`) + "\n");
+	}
+
+	for (const record of shown) {
+		write(highlight(record) + "\n");
+	}
+};
+
+const setFilter = term => {
+	const t = term.trim();
+	if (!t) {
+		filter = null;
+	} else {
+		filter = { term: t, test: new RegExp(escapeRe(t), "i"), mark: new RegExp(escapeRe(t), "gi") };
+	}
+
+	redraw();
+};
+
+const printHelp = () => {
+	write("\n" + bold("keys") + "\n");
+	write(`  ${yellow("/")}       type a search term, then Enter. Only matching entries are shown (whole MCP/API blocks), matches highlighted.\n`);
+	write(`  ${yellow("Esc")}     clear the search and show everything again (while typing: cancel).\n`);
+	write(`  ${yellow("c")}       clear the screen (history is kept, search still works on it).\n`);
+	write(`  ${yellow("?")}       this help.\n`);
+	write(`  ${yellow("Ctrl+C")}  quit (stops the MCP server too).\n\n`);
+};
+
+const handleKey = (str, key) => {
+	if (key?.ctrl && key.name === "c") {
+		process.emit("SIGINT");
+		return;
+	}
+
+	if (typing !== null) {
+		if (key?.name === "return") {
+			write("\n");
+			const term = typing;
+			typing = null;
+			setFilter(term);
+		} else if (key?.name === "escape") {
+			typing = null;
+			write("\n");
+			redraw();
+		} else if (key?.name === "backspace") {
+			if (typing.length > 0) {
+				typing = typing.slice(0, -1);
+				write("\b \b");
+			}
+		} else if (str && !key?.ctrl && !key?.meta && str >= " ") {
+			typing += str;
+			write(str);
+		}
+
+		return;
+	}
+
+	if (str === "/") {
+		typing = filter?.term ?? "";
+		write("\n" + yellow("search: ") + typing);
+	} else if (key?.name === "escape") {
+		if (filter) {
+			setFilter("");
+		}
+	} else if (str === "c") {
+		clearScreen();
+		printHeader();
+	} else if (str === "?" || str === "h") {
+		printHelp();
+	}
+};
+
+process.on("SIGINT", () => {
+	if (logcatProc) {
+		logcatProc.kill();
+	}
+
+	process.exit(0);
+});
+
+if (process.stdin.isTTY) {
+	emitKeypressEvents(process.stdin);
+	process.stdin.setRawMode(true);
+	process.stdin.resume();
+	process.stdin.on("keypress", handleKey);
+}
+
+if (INITIAL_GREP) {
+	setFilter(INITIAL_GREP);
+} else {
+	clearScreen();
+	printHeader();
+}
+
 followLogcat();

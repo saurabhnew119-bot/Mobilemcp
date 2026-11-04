@@ -2,9 +2,12 @@
 // Single-terminal log viewer for mobile-mcp + an Android app under test.
 //
 //   node scripts/dev-logs.mjs [--package com.mli.mspace] [--device emulator-5554]
-//                             [--port 3100] [--full] [--headers] [--all-logcat]
-//                             [--no-server] [--no-color] [--no-clear]
+//                             [--port 3100] [--compact] [--full] [--headers]
+//                             [--all-logcat] [--no-server] [--no-color] [--no-clear]
 //                             [--grep <term>] [--log-file out.log]
+//
+// Responses are shown complete and pretty-printed by default; --compact
+// shortens bodies to one line and long tool results to 12 lines.
 //
 // Keys while running: "/" search (filter + highlight, including earlier
 // entries), Esc clear search, "c" clear screen, "?" help, Ctrl+C quit.
@@ -39,8 +42,11 @@ const CLEAR_ON_RESTART = !flag("no-clear");
 const INITIAL_GREP = opt("grep", null);
 const COLOR = !flag("no-color") && process.stdout.isTTY;
 const LOG_FILE = opt("log-file", null);
-const MAX_INLINE = FULL ? Infinity : 320;
-const MAX_RESULT_LINES = FULL ? Infinity : 12;
+// Responses are printed complete by default. --compact shortens long bodies
+// and long tool results so more entries fit on one screen.
+const COMPACT = flag("compact") && !FULL;
+const MAX_INLINE = COMPACT ? 320 : Infinity;
+const MAX_RESULT_LINES = COMPACT ? 12 : Infinity;
 
 const ADB = process.env.ADB || resolve(process.env.LOCALAPPDATA || "", "Android/Sdk/platform-tools/adb.exe");
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -98,7 +104,7 @@ const compactJson = value => {
 };
 
 const prettyOrCompact = value => {
-	if (!FULL) {
+	if (COMPACT) {
 		return [compactJson(value)];
 	}
 
@@ -347,6 +353,7 @@ const isNoise = (tag, msg) => NOISE.some(re => re.test(msg) || re.test(tag));
 
 // Collapse Java stack traces: keep the first few frames, count the rest.
 const MAX_FRAMES = FULL ? Infinity : 3;
+const MAX_LINE = COMPACT ? 400 : Infinity;
 let frameCount = 0;
 let framesHidden = 0;
 
@@ -419,7 +426,7 @@ const handleLogcatLine = raw => {
 	const important = level === "E" || level === "F" || level === "W";
 	if (ALL_LOGCAT || important || INTERESTING_TAGS.has(tag) || tag.includes(PACKAGE)) {
 		const tone = levelColor[level] ?? (s => s);
-		const text = !FULL && msg.length > 400 ? msg.slice(0, 400) + dim(` ...(+${msg.length - 400} chars)`) : msg;
+		const text = msg.length > MAX_LINE ? msg.slice(0, MAX_LINE) + dim(` ...(+${msg.length - MAX_LINE} chars)`) : msg;
 		out(`${bold(blue("APP"))}  ${dim(now())}  ${tone(level)}/${tone(tag.replace(/^unknown:/, ""))}  ${tone(text)}`);
 	}
 };
@@ -533,6 +540,7 @@ const followLogcat = () => {
 const printHeader = () => {
 	write(bold(`mobile-mcp dev logs  ${dim("-")}  app ${PACKAGE}  ${dim("-")}  device ${DEVICE}  ${dim("-")}  ${NO_SERVER ? "server: external" : `server http://127.0.0.1:${PORT}/mcp`}`) + "\n");
 	write(dim("keys:  /  search (filters + highlights, includes earlier logs)   Esc  clear search   c  clear screen   ?  help   Ctrl+C  quit") + "\n");
+	write(dim(`responses: ${COMPACT ? "compact (--compact)" : "complete, pretty-printed (use --compact to shorten)"}   noise filter: ${FULL || ALL_LOGCAT ? "off" : "on (--full or --all-logcat to disable)"}`) + "\n");
 	if (filter) {
 		const count = history.filter(matches).length;
 		write(yellow(`filter: "${filter.term}"  -  ${count} of ${history.length} entries match  -  Esc to clear`) + "\n");

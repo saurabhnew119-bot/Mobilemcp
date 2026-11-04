@@ -18,6 +18,7 @@
     "fixlint": "eslint . --fix",
     "test": "c8 playwright test",
     "watch": "tsc --watch",
+    "dev:logs": "node scripts/dev-logs.mjs",
     "clean": "rm -rf lib",
     "prepare": "husky"
   },

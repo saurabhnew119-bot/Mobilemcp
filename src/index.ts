@@ -5,6 +5,7 @@ import { createMcpHandler } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import { createMcpServer, getAgentVersion, getSdkVersion } from "./server";
 import { error } from "./logger";
+import { requestLogger } from "./request-logger";
 import { Request, Response } from "express";
 import { program } from "commander";
 
@@ -18,6 +19,9 @@ const startHttpServer = async (host: string, port: number) => {
 	// createMcpExpressApp applies express.json() and Host-header DNS rebinding
 	// protection automatically when binding to localhost / 127.0.0.1 / ::1.
 	const app = createMcpExpressApp({ host });
+
+	// Print every request/response body so tool calls can be followed in the log.
+	app.use(requestLogger);
 
 	// Migration hint for clients still pointing at the removed SSE transport.
 	// Registered before auth so unauthenticated clients see the reason, not a 401.

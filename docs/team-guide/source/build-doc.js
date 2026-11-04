@@ -11,7 +11,7 @@ const {
 const OUT = process.argv[2] || path.join(__dirname, "Mobilemcp-Team-Guide.docx");
 // Repository the team clones from. Replace once the branch is pushed to the team's fork.
 const REPO_URL = process.env.REPO_URL || "https://github.com/<your-org>/mobile-mcp.git";
-const BRANCH = "feature/dev-logs-viewer";
+const BRANCH = process.env.REPO_BRANCH || "main";
 const UPSTREAM_URL = "https://github.com/mobile-next/mobile-mcp.git";
 const BRAND = "C:/Users/SaurabhKumar/.claude/skills/synced/5c8cd8f7-9f34-4af7-9d7c-75b19a8c8db4_a8c47802-5bc4-475a-b681-5660c29d7f23/monocept-brand/assets";
 
@@ -372,7 +372,7 @@ children.push(
 		["mobile_batch_commands", "Run a known sequence (tap, type, tap) in one round trip."],
 	], [40, 60], "orange"),
 	spacer(),
-	p([run("Questions or improvements: raise them on the feature/dev-logs-viewer branch so the fixes land in one place.", { italics: true, color: MID })]),
+	p([run(`Questions or improvements: raise them against the ${BRANCH} branch of the team repository so the fixes land in one place.`, { italics: true, color: MID })]),
 );
 
 // =====================================================================

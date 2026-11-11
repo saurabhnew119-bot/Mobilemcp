@@ -10,7 +10,9 @@
 // shortens bodies to one line and long tool results to 12 lines.
 //
 // Keys while running: "/" search (filter + highlight, including earlier
-// entries), Esc clear search, "c" clear screen, "?" help, Ctrl+C quit.
+// entries), Esc clear search, "c" clear screen, "x" clear screen + history,
+// "r" rerun (restart the MCP server and logcat, fresh screen), "?" help,
+// Ctrl+C quit.
 //
 // It starts `node lib/index.js --listen 127.0.0.1:<port>` and streams two things
 // into one readable feed:
@@ -446,23 +448,43 @@ const readLines = (stream, handler) => {
 };
 
 // ---------- start server ----------
-if (!NO_SERVER) {
+let serverProc = null;
+
+const startServer = () => {
 	const server = spawn(process.execPath, [resolve(ROOT, "lib/index.js"), "--listen", `127.0.0.1:${PORT}`], {
 		cwd: ROOT,
 		env: { ...process.env, MOBILEMCP_LOG_REQUESTS: "1" },
 		stdio: ["ignore", "pipe", "pipe"],
 		windowsHide: true,
 	});
+	serverProc = server;
 	readLines(server.stderr, handleMcpLine);
 	readLines(server.stdout, handleMcpLine);
 	server.on("exit", code => {
+		if (serverProc !== server) {
+			return; // stopped on purpose by a rerun or quit
+		}
+
 		out(red(`MCP server exited with code ${code}`));
 		process.exit(code ?? 1);
 	});
-	process.on("SIGINT", () => {
-		server.kill();
-		process.exit(0);
-	});
+};
+
+// Stop the server and wait until it is gone, so the port is free again.
+const stopServer = () => new Promise(done => {
+	const server = serverProc;
+	serverProc = null;
+	if (!server || server.exitCode !== null || server.signalCode !== null) {
+		done();
+		return;
+	}
+
+	server.once("exit", () => done());
+	server.kill();
+});
+
+if (!NO_SERVER) {
+	startServer();
 }
 
 // ---------- start logcat, following app restarts ----------
@@ -509,6 +531,17 @@ const clearScreen = () => {
 	}
 };
 
+// Forget everything printed so far, not just what is on screen.
+const resetState = () => {
+	history.length = 0;
+	pending.clear();
+	mcpState = null;
+	suppressUntilMarker = false;
+	apiBlock = null;
+	frameCount = 0;
+	framesHidden = 0;
+};
+
 const followLogcat = () => {
 	const pid = pidOf();
 	if (pid && pid !== currentPid) {
@@ -539,7 +572,7 @@ const followLogcat = () => {
 
 const printHeader = () => {
 	write(bold(`mobile-mcp dev logs  ${dim("-")}  app ${PACKAGE}  ${dim("-")}  device ${DEVICE}  ${dim("-")}  ${NO_SERVER ? "server: external" : `server http://127.0.0.1:${PORT}/mcp`}`) + "\n");
-	write(dim("keys:  /  search (filters + highlights, includes earlier logs)   Esc  clear search   c  clear screen   ?  help   Ctrl+C  quit") + "\n");
+	write(dim("keys:  /  search   Esc  clear search   c  clear screen   x  clear screen + history   r  rerun   ?  help   Ctrl+C  quit") + "\n");
 	write(dim(`responses: ${COMPACT ? "compact (--compact)" : "complete, pretty-printed (use --compact to shorten)"}   noise filter: ${FULL || ALL_LOGCAT ? "off" : "on (--full or --all-logcat to disable)"}`) + "\n");
 	if (filter) {
 		const count = history.filter(matches).length;
@@ -580,6 +613,8 @@ const printHelp = () => {
 	write(`  ${yellow("/")}       type a search term, then Enter. Only matching entries are shown (whole MCP/API blocks), matches highlighted.\n`);
 	write(`  ${yellow("Esc")}     clear the search and show everything again (while typing: cancel).\n`);
 	write(`  ${yellow("c")}       clear the screen (history is kept, search still works on it).\n`);
+	write(`  ${yellow("x")}       clear the screen and the history (start again with an empty log).\n`);
+	write(`  ${yellow("r")}       rerun: restart the MCP server and re-attach logcat, with a fresh screen.\n`);
 	write(`  ${yellow("?")}       this help.\n`);
 	write(`  ${yellow("Ctrl+C")}  quit (stops the MCP server too).\n\n`);
 };
@@ -623,12 +658,57 @@ const handleKey = (str, key) => {
 	} else if (str === "c") {
 		clearScreen();
 		printHeader();
+	} else if (str === "x") {
+		resetState();
+		clearScreen();
+		printHeader();
+		out(dim(`${now()}  screen and history cleared`));
+	} else if (str === "r") {
+		rerun();
 	} else if (str === "?" || str === "h") {
 		printHelp();
 	}
 };
 
+// Restart everything this viewer runs, in the same terminal window.
+let rerunning = false;
+const rerun = async () => {
+	if (rerunning) {
+		return;
+	}
+
+	rerunning = true;
+	write("\n" + yellow("rerunning...") + "\n");
+	if (logcatProc) {
+		logcatProc.removeAllListeners("exit");
+		logcatProc.kill();
+		logcatProc = null;
+	}
+
+	currentPid = null;
+	runCount = 0;
+	if (!NO_SERVER) {
+		await stopServer();
+	}
+
+	resetState();
+	clearScreen();
+	printHeader();
+	if (!NO_SERVER) {
+		startServer();
+	}
+
+	out(dim(`${now()}  rerun: ${NO_SERVER ? "" : "MCP server restarted, "}re-attaching logcat`));
+	rerunning = false;
+};
+
 process.on("SIGINT", () => {
+	if (serverProc) {
+		const server = serverProc;
+		serverProc = null;
+		server.kill();
+	}
+
 	if (logcatProc) {
 		logcatProc.kill();
 	}

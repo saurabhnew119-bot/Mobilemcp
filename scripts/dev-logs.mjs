@@ -5,14 +5,21 @@
 //                             [--port 3100] [--compact] [--full] [--headers]
 //                             [--all-logcat] [--no-server] [--no-color] [--no-clear]
 //                             [--grep <term>] [--log-file out.log]
+//                             [--slow <ms>] [--watch <api path or part of it>]
 //
 // Responses are shown complete and pretty-printed by default; --compact
 // shortens bodies to one line and long tool results to 12 lines.
 //
 // Keys while running: "/" search (filter + highlight, including earlier
 // entries), Esc clear search, "c" clear screen, "x" clear screen + history,
-// "r" rerun (restart the MCP server and logcat, fresh screen), "?" help,
-// Ctrl+C quit.
+// "r" rerun (restart the MCP server and logcat, fresh screen), "e" problems
+// only, "w" watch an API, "?" help, Ctrl+C quit.
+//
+// Problems are detected while the app runs: failed API calls (HTTP 4xx/5xx,
+// or a 200 whose body says status "Failure", statusCode >= 400 or
+// success: false), API calls slower than --slow ms (default 2000), error
+// and crash logs, and MCP tool errors. Each is tagged FAIL / SLOW / ERROR,
+// and "e" switches to a view that shows only those (plus watched API calls).
 //
 // It starts `node lib/index.js --listen 127.0.0.1:<port>` and streams two things
 // into one readable feed:
@@ -49,6 +56,8 @@ const LOG_FILE = opt("log-file", null);
 const COMPACT = flag("compact") && !FULL;
 const MAX_INLINE = COMPACT ? 320 : Infinity;
 const MAX_RESULT_LINES = COMPACT ? 12 : Infinity;
+// API calls slower than this are flagged SLOW.
+const SLOW_MS = Number(opt("slow", "2000")) || 2000;
 
 const ADB = process.env.ADB || resolve(process.env.LOCALAPPDATA || "", "Android/Sdk/platform-tools/adb.exe");
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -73,27 +82,52 @@ const write = s => process.stdout.write(s);
 // Records are kept in memory so a search can be applied to what was already
 // printed, not just to new output. Press "/" in the terminal to search.
 const MAX_HISTORY = 5000;
+// Each entry: { text, issue: "fail" | "slow" | "error" | null, api: full URL of an API call or null }
 const history = [];
 let filter = null; // { term, test: RegExp, mark: RegExp }
-let typing = null; // text being typed after "/" or null
+let typing = null; // text being typed after "/" or "w", or null
+let typingFor = "search"; // what Enter applies the typed text to: "search" | "watch"
+let issuesOnly = false; // "e": show only problems and watched API calls
+let watchTerm = opt("watch", null); // "w": API path (or part of it) to watch
+const counts = { fail: 0, slow: 0, error: 0, watched: 0 };
 
 const escapeRe = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-const matches = record => !filter || filter.test.test(stripAnsi(record));
-const highlight = record => (filter ? record.replace(filter.mark, m => c("7", m)) : record);
+const matches = text => !filter || filter.test.test(stripAnsi(text));
+const highlight = text => (filter ? text.replace(filter.mark, m => c("7", m)) : text);
+const isWatched = entry => Boolean(watchTerm && entry.api && entry.api.toLowerCase().includes(watchTerm.toLowerCase()));
+const isVisible = entry => (!issuesOnly || entry.issue || isWatched(entry)) && matches(entry.text);
+const render = entry => (isWatched(entry) ? bold(magenta("[WATCH] ")) : "") + highlight(entry.text);
 
-const out = record => {
-	history.push(record);
+const out = (text, meta = {}) => {
+	const entry = { text, issue: meta.issue ?? null, api: meta.api ?? null };
+	history.push(entry);
 	if (history.length > MAX_HISTORY) {
 		history.shift();
 	}
 
-	if (LOG_FILE) {
-		appendFileSync(LOG_FILE, stripAnsi(record) + "\n");
+	// "related" lines (stack frames under an error) show in the problems view but are not counted again.
+	if (entry.issue && !meta.related) {
+		counts[entry.issue]++;
 	}
 
-	if (typing === null && matches(record)) {
-		write(highlight(record) + "\n");
+	if (isWatched(entry)) {
+		counts.watched++;
 	}
+
+	if (LOG_FILE) {
+		appendFileSync(LOG_FILE, stripAnsi(render(entry)) + "\n");
+	}
+
+	if (typing === null && isVisible(entry)) {
+		write(render(entry) + "\n");
+	}
+};
+
+// Short coloured tags put in front of a problem entry.
+const TAG = {
+	fail: () => bold(red("[FAIL]")),
+	slow: () => bold(yellow("[SLOW]")),
+	error: () => bold(red("[ERROR]")),
 };
 
 const compactJson = value => {
@@ -131,9 +165,9 @@ const statusColor = status => {
 	return green(String(status));
 };
 
-const box = (title, lines, footer) => {
+const box = (title, lines, footer, meta) => {
 	const block = [title, ...lines.map(l => `${dim("|")}  ${l}`), `${dim("+--")} ${footer ?? ""}`, ""];
-	out(block.join("\n"));
+	out(block.join("\n"), meta);
 };
 
 // ---------- MCP side: parse the request-logger stream ----------
@@ -179,7 +213,8 @@ const summarizeResult = (request, response) => {
 const printMcp = (id, request, response, status, ms) => {
 	const method = request.method ?? "?";
 	const tool = request.params?.name;
-	const title = `${dim("+--")} ${bold(cyan("MCP"))} ${dim("#" + id)}  ${dim(now())}  ${bold(method)}${tool ? "  " + magenta(tool) : ""}`;
+	const failed = Boolean(response.error || response.result?.isError || Number(status) >= 400);
+	const title = `${dim("+--")} ${failed ? TAG.error() + " " : ""}${bold(cyan("MCP"))} ${dim("#" + id)}  ${dim(now())}  ${bold(method)}${tool ? "  " + magenta(tool) : ""}`;
 	const lines = [];
 	const args = describeArgs(request.params?.arguments ?? (method === "tools/call" ? {} : request.params));
 	if (args) {
@@ -190,7 +225,7 @@ const printMcp = (id, request, response, status, ms) => {
 		lines.push(`${dim("result ")} ${l}`);
 	}
 
-	box(title, lines, `${statusColor(status)} ${dim("-")} ${ms} ms`);
+	box(title, lines, `${statusColor(status)} ${dim("-")} ${ms} ms`, { issue: failed ? "error" : null });
 };
 
 const tryParseBuffer = buf => {
@@ -295,6 +330,68 @@ const parseApiBlock = lines => {
 	return fields;
 };
 
+// "340 ms", "1563ms", "1.5 s" -> milliseconds (NaN if unknown).
+const parseDurationMs = text => {
+	const m = String(text ?? "").match(/([\d.]+)\s*(ms|s)?\b/i);
+	if (!m) {
+		return NaN;
+	}
+
+	return Number(m[1]) * (m[2]?.toLowerCase() === "s" ? 1000 : 1);
+};
+
+// Many backends answer HTTP 200 with a failure inside the body, e.g.
+// { "status": "Failure", "statusCode": 498, "message": "User is already logged in from another device" }.
+const bodyFailure = body => {
+	if (!body || typeof body !== "object" || Array.isArray(body)) {
+		return null;
+	}
+
+	const status = String(body.status ?? "");
+	const code = Number(body.statusCode ?? body.code);
+	if (/^(fail|failure|failed|error)$/i.test(status) || code >= 400 || body.success === false || body.isSuccess === false) {
+		const parts = [];
+		if (status) parts.push(`status "${status}"`);
+		if (code >= 400) parts.push(`statusCode ${code}`);
+		if (body.success === false || body.isSuccess === false) parts.push("success: false");
+		const message = body.message ?? body.errorMessage ?? body.error;
+		return parts.join(", ") + (message ? `: ${typeof message === "object" ? JSON.stringify(message) : message}` : "");
+	}
+
+	return null;
+};
+
+// Why an API call is a problem: { issue: "fail" | "slow" | null, reasons: [...] }.
+const apiProblems = f => {
+	const reasons = [];
+	let issue = null;
+	const httpStatus = Number((f.STATUS ?? "").trim());
+	if (httpStatus >= 400) {
+		reasons.push(red(`HTTP ${httpStatus}`));
+		issue = "fail";
+	}
+
+	if (f.ERROR && !/^No Error/i.test(f.ERROR.trim()) && !issue) {
+		reasons.push(red("request error (see below)"));
+		issue = "fail";
+	}
+
+	const inBody = bodyFailure(f.RESPONSE);
+	if (inBody) {
+		reasons.push(red(`response says ${inBody}`));
+		issue = "fail";
+	}
+
+	const ms = parseDurationMs(f.DURATION);
+	const slow = ms > SLOW_MS;
+	if (slow) {
+		reasons.push(yellow(`took ${ms} ms (slow limit ${SLOW_MS} ms)`));
+		issue ??= "slow";
+	}
+
+	return { issue, slow, reasons };
+};
+
 const printApiBlock = lines => {
 	const f = parseApiBlock(lines);
 	let path = f.URL ?? "";
@@ -308,8 +405,11 @@ const printApiBlock = lines => {
 	}
 
 	const status = (f.STATUS ?? "").trim();
-	const title = `${dim("+--")} ${bold(blue("APP API"))}  ${dim(now())}  ${bold(f.METHOD ?? "?")} ${path}   ${statusColor(status)} ${dim("-")} ${(f.DURATION ?? "").trim()}${f.SCREEN ? dim("   screen=" + f.SCREEN.trim()) : ""}`;
-	const body = [];
+	const problems = apiProblems(f);
+	const tags = [problems.issue === "fail" ? TAG.fail() : "", problems.slow ? TAG.slow() : ""].filter(Boolean).join(" ");
+	const duration = (f.DURATION ?? "").trim();
+	const title = `${dim("+--")} ${tags ? tags + " " : ""}${bold(blue("APP API"))}  ${dim(now())}  ${bold(f.METHOD ?? "?")} ${path}   ${statusColor(status)} ${dim("-")} ${problems.slow ? bold(yellow(duration)) : duration}${f.SCREEN ? dim("   screen=" + f.SCREEN.trim()) : ""}`;
+	const body = problems.reasons.map(r => `${bold("problem ")} ${r}`);
 	if (SHOW_HEADERS && f.HEADERS) {
 		for (const l of prettyOrCompact(typeof f.HEADERS === "object" ? redactHeaders(f.HEADERS) : f.HEADERS)) {
 			body.push(`${dim("headers ")} ${l}`);
@@ -332,7 +432,7 @@ const printApiBlock = lines => {
 		body.push(`${dim("error   ")} ${red(f.ERROR.trim())}`);
 	}
 
-	box(title, body, dim(host));
+	box(title, body, dim(host), { issue: problems.issue, api: f.URL ?? path });
 };
 
 const levelColor = { V: dim, D: dim, I: s => s, W: yellow, E: red, F: red };
@@ -358,10 +458,11 @@ const MAX_FRAMES = FULL ? Infinity : 3;
 const MAX_LINE = COMPACT ? 400 : Infinity;
 let frameCount = 0;
 let framesHidden = 0;
+let frameIssue = null; // the issue of the line a stack trace belongs to
 
 const flushFrames = () => {
 	if (framesHidden > 0) {
-		out(`${bold(blue("APP"))}  ${dim(now())}  ${dim(`      ...(+${framesHidden} more frames)`)}`);
+		out(`${bold(blue("APP"))}  ${dim(now())}  ${dim(`      ...(+${framesHidden} more frames)`)}`, { issue: frameIssue, related: true });
 	}
 
 	frameCount = 0;
@@ -414,7 +515,8 @@ const handleLogcatLine = raw => {
 		if (rn) {
 			const [, , lvl, text] = rn;
 			const tone = /ERROR/i.test(lvl) ? red : /WARN/i.test(lvl) ? yellow : /DEBUG/i.test(lvl) ? dim : s => s;
-			out(`${bold(blue("APP"))}  ${dim(now())}  ${tone(lvl.padEnd(5))}  ${tone(text)}`);
+			const isError = /ERROR|FATAL/i.test(lvl);
+			out(`${isError ? TAG.error() + " " : ""}${bold(blue("APP"))}  ${dim(now())}  ${tone(lvl.padEnd(5))}  ${tone(text)}`, { issue: isError ? "error" : null });
 			return;
 		}
 
@@ -429,7 +531,14 @@ const handleLogcatLine = raw => {
 	if (ALL_LOGCAT || important || INTERESTING_TAGS.has(tag) || tag.includes(PACKAGE)) {
 		const tone = levelColor[level] ?? (s => s);
 		const text = msg.length > MAX_LINE ? msg.slice(0, MAX_LINE) + dim(` ...(+${msg.length - MAX_LINE} chars)`) : msg;
-		out(`${bold(blue("APP"))}  ${dim(now())}  ${tone(level)}/${tone(tag.replace(/^unknown:/, ""))}  ${tone(text)}`);
+		// Stack frames belong to the error above them: same visibility, no new tag or count.
+		const isError = level === "E" || level === "F" || (tag === "AndroidRuntime" && /FATAL/.test(msg));
+		if (!isFrame) {
+			frameIssue = isError ? "error" : null;
+		}
+
+		const showTag = isError && !isFrame;
+		out(`${showTag ? TAG.error() + " " : ""}${bold(blue("APP"))}  ${dim(now())}  ${tone(level)}/${tone(tag.replace(/^unknown:/, ""))}  ${tone(text)}`, { issue: isFrame ? frameIssue : isError ? "error" : null, related: isFrame });
 	}
 };
 
@@ -438,7 +547,7 @@ const handleLogcatLine = raw => {
 const tagStderr = (stream, label) => {
 	readLines(stream, line => {
 		if (line.trim()) {
-			out(`${bold(red(label))}  ${dim(now())}  ${red(line)}`);
+			out(`${TAG.error()} ${bold(red(label))}  ${dim(now())}  ${red(line)}`, { issue: "error" });
 		}
 	});
 };
@@ -531,9 +640,16 @@ const clearScreen = () => {
 	}
 };
 
+const resetHistory = () => {
+	history.length = 0;
+	for (const key of Object.keys(counts)) {
+		counts[key] = 0;
+	}
+};
+
 // Forget everything printed so far, not just what is on screen.
 const resetState = () => {
-	history.length = 0;
+	resetHistory();
 	pending.clear();
 	mcpState = null;
 	suppressUntilMarker = false;
@@ -547,7 +663,7 @@ const followLogcat = () => {
 	if (pid && pid !== currentPid) {
 		if (runCount > 0) {
 			if (CLEAR_ON_RESTART) {
-				history.length = 0;
+				resetHistory();
 				clearScreen();
 				printHeader();
 				out(`${bold(blue("APP"))}  ${dim(now())}  ${yellow(`${PACKAGE} run #${runCount + 1} started (pid ${pid}). Terminal cleared.`)}`);
@@ -572,29 +688,51 @@ const followLogcat = () => {
 
 const printHeader = () => {
 	write(bold(`mobile-mcp dev logs  ${dim("-")}  app ${PACKAGE}  ${dim("-")}  device ${DEVICE}  ${dim("-")}  ${NO_SERVER ? "server: external" : `server http://127.0.0.1:${PORT}/mcp`}`) + "\n");
-	write(dim("keys:  /  search   Esc  clear search   c  clear screen   x  clear screen + history   r  rerun   ?  help   Ctrl+C  quit") + "\n");
+	write(dim("keys:  /  search   Esc  clear search   e  problems only   w  watch API   c  clear screen   x  clear screen + history   r  rerun   ?  help   Ctrl+C  quit") + "\n");
 	write(dim(`responses: ${COMPACT ? "compact (--compact)" : "complete, pretty-printed (use --compact to shorten)"}   noise filter: ${FULL || ALL_LOGCAT ? "off" : "on (--full or --all-logcat to disable)"}`) + "\n");
+	const problemText = `problems: ${counts.fail} failed API   ${counts.slow} slow API (over ${SLOW_MS} ms)   ${counts.error} errors`;
+	write((counts.fail || counts.error ? red(problemText) : counts.slow ? yellow(problemText) : dim(problemText)) + "\n");
+	if (watchTerm) {
+		write(magenta(`watching API: "${watchTerm}"  -  ${counts.watched} calls so far  -  w then Enter on empty text to stop`) + "\n");
+	}
+
+	if (issuesOnly) {
+		write(yellow(`view: problems only${watchTerm ? " + watched API" : ""}  -  e to show everything`) + "\n");
+	}
+
 	if (filter) {
-		const count = history.filter(matches).length;
+		const count = history.filter(isVisible).length;
 		write(yellow(`filter: "${filter.term}"  -  ${count} of ${history.length} entries match  -  Esc to clear`) + "\n");
 	}
 
 	write("\n");
 };
 
-// Redraw the screen from history, applying the current filter.
+// Redraw the screen from history, applying the current filter and view.
 const redraw = () => {
 	clearScreen();
 	printHeader();
-	const visible = history.filter(matches);
-	const shown = filter ? visible : visible.slice(-300);
-	if (!filter && visible.length > shown.length) {
+	const visible = history.filter(isVisible);
+	const narrowed = filter || issuesOnly;
+	const shown = narrowed ? visible : visible.slice(-300);
+	if (visible.length > shown.length) {
 		write(dim(`...(${visible.length - shown.length} earlier entries not shown, use / to search them)`) + "\n");
 	}
 
-	for (const record of shown) {
-		write(highlight(record) + "\n");
+	if (issuesOnly && visible.length === 0) {
+		write(green(`no problems${filter ? " matching the search" : ""} so far`) + "\n");
 	}
+
+	for (const entry of shown) {
+		write(render(entry) + "\n");
+	}
+};
+
+const setWatch = term => {
+	const t = term.trim();
+	watchTerm = t || null;
+	counts.watched = watchTerm ? history.filter(isWatched).length : 0;
+	redraw();
 };
 
 const setFilter = term => {
@@ -612,6 +750,12 @@ const printHelp = () => {
 	write("\n" + bold("keys") + "\n");
 	write(`  ${yellow("/")}       type a search term, then Enter. Only matching entries are shown (whole MCP/API blocks), matches highlighted.\n`);
 	write(`  ${yellow("Esc")}     clear the search and show everything again (while typing: cancel).\n`);
+	write(`  ${yellow("e")}       problems only: failed API calls [FAIL], slow API calls [SLOW], errors/crashes [ERROR],\n`);
+	write(`          plus watched API calls. Press e again to show everything. Counts are in the header.\n`);
+	write(`  ${yellow("w")}       watch an API: type a path or part of it (e.g. powerbi-info), Enter. Its calls get a [WATCH] tag\n`);
+	write(`          and stay visible in the problems view. Empty text + Enter stops watching.\n`);
+	write(`          A call is FAIL on HTTP 4xx/5xx or when the body says status "Failure", statusCode >= 400 or success: false.\n`);
+	write(`          It is SLOW when it takes longer than ${SLOW_MS} ms (start with --slow <ms> to change).\n`);
 	write(`  ${yellow("c")}       clear the screen (history is kept, search still works on it).\n`);
 	write(`  ${yellow("x")}       clear the screen and the history (start again with an empty log).\n`);
 	write(`  ${yellow("r")}       rerun: restart the MCP server and re-attach logcat, with a fresh screen.\n`);
@@ -630,7 +774,11 @@ const handleKey = (str, key) => {
 			write("\n");
 			const term = typing;
 			typing = null;
-			setFilter(term);
+			if (typingFor === "watch") {
+				setWatch(term);
+			} else {
+				setFilter(term);
+			}
 		} else if (key?.name === "escape") {
 			typing = null;
 			write("\n");
@@ -649,8 +797,16 @@ const handleKey = (str, key) => {
 	}
 
 	if (str === "/") {
+		typingFor = "search";
 		typing = filter?.term ?? "";
 		write("\n" + yellow("search: ") + typing);
+	} else if (str === "w") {
+		typingFor = "watch";
+		typing = watchTerm ?? "";
+		write("\n" + magenta("watch API (path or part of it, empty = stop): ") + typing);
+	} else if (str === "e") {
+		issuesOnly = !issuesOnly;
+		redraw();
 	} else if (key?.name === "escape") {
 		if (filter) {
 			setFilter("");

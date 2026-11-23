@@ -82,7 +82,18 @@ const startHttpServer = async (host: string, port: number) => {
 	app.get("/mcp", methodNotAllowed);
 	app.delete("/mcp", methodNotAllowed);
 
-	app.listen(port, host, () => {
+	// Express 5 passes bind failures (EADDRINUSE, EACCES) to this callback
+	// instead of throwing; without the check the process logged "listening"
+	// and then exited 0 with nothing bound.
+	app.listen(port, host, (err?: Error) => {
+		if (err) {
+			const reason = (err as NodeJS.ErrnoException).code === "EADDRINUSE"
+				? `port ${port} on ${host} is already in use (is another mobile-mcp server still running?)`
+				: err.message;
+			error(`mobile-mcp could not start the http server: ${reason}`);
+			process.exit(1);
+		}
+
 		error(`mobile-mcp ${getAgentVersion()} streamable http server listening on http://${host}:${port}/mcp`);
 	});
 };

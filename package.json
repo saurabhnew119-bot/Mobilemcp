@@ -14,6 +14,7 @@
   "scripts": {
     "build": "tsc",
     "start": "node lib/index.js",
+    "dev": "node scripts/start.mjs",
     "lint": "eslint .",
     "fixlint": "eslint . --fix",
     "test": "c8 playwright test",
